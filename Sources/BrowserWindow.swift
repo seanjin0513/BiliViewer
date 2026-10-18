@@ -9,6 +9,7 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate, WKUID
     private var hudLabel: NSTextField?
     private var hudIcon: NSImageView?
     private var hudHideWork: DispatchWorkItem?
+    private var sensitivityItems: [NSMenuItem] = []
 
     convenience init() {
         let window = NSWindow(
@@ -42,23 +43,63 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate, WKUID
     // MARK: - WebView
 
     /// 播放器悬停检测:mousemove/scroll 时用 elementFromPoint 命中测试,
-    /// 状态变化(或悬停中每 300ms)经 biliHover 回传 {over, rect} 给原生(60ms 节流)
+    /// 状态变化(或悬停中每 300ms)经 biliHover 回传 {over, rect} 给原生(60ms 节流)。
+    /// 每个同源 frame 都会注入(新版直播播放器位于 /blanc/<room> 的同源 iframe),
+    /// rect 会逐级换算成顶层页面坐标,供音量 HUD 正确定位。
     static let hoverDetectJS = """
     (function(){
-      var over = false, lastX = -1, lastY = -1, lastT = 0, lastPost = 0;
+      // ---- 播放器/视频定位(每个 frame 各自执行) ----
+      function mainVideo() {
+        var vs = document.querySelectorAll('video');
+        var best = null, bestArea = -1;
+        for (var i = 0; i < vs.length; i++) {
+          var a = (vs[i].videoWidth || 0) * (vs[i].videoHeight || 0);
+          if (a > bestArea) { bestArea = a; best = vs[i]; }
+        }
+        return best;
+      }
+      // 暴露给原生:全屏切换前后读取/恢复暂停状态用
+      window.__biliViewerMainVideo = mainVideo;
+
+      // 旧版播放器 + 新版直播播放器(直播间 /blanc iframe 里的 #live-player 等)容器
+      var PLAYER_SELECTOR = '.bpx-player-container, .bilibili-player, #live-player, #player-ctnr, .player-section, .live-player, .bpx-player-video-area';
+
       function findPlayer(x, y) {
         var el = document.elementFromPoint(x, y);
         if (!el) return null;
         if (el.tagName === 'VIDEO') return el;
-        return el.closest && el.closest('.bpx-player-container, .bilibili-player');
+        var c = el.closest && el.closest(PLAYER_SELECTOR);
+        if (c) return c;
+        // 兜底:指针落在主视频矩形内(新版直播播放器有弹幕/控制层遮挡,命中的 DOM 不一定是容器)
+        var v = mainVideo();
+        if (v) {
+          var r = v.getBoundingClientRect();
+          if (r.width > 0 && x >= r.left && x <= r.right && y >= r.top && y <= r.bottom) return v;
+        }
+        return null;
       }
+
+      // 本 frame 视口坐标 → 顶层页面坐标(同源 iframe 逐级累加)
+      function rectInTop(r) {
+        var x = r.left, y = r.top, w = r.width, h = r.height, win = window;
+        try {
+          while (win !== win.top) {
+            var fe = win.frameElement;
+            if (!fe) break;
+            var pr = fe.getBoundingClientRect();
+            x += pr.left;
+            y += pr.top;
+            win = win.parent;
+          }
+        } catch (e) {}
+        return { x: x, y: y, w: w, h: h };
+      }
+
+      var over = false, lastX = -1, lastY = -1, lastT = 0, lastPost = 0;
       function post(v, x, y) {
         var target = findPlayer(x, y);
         var rect = null;
-        if (target) {
-          var r = target.getBoundingClientRect();
-          rect = { x: r.left, y: r.top, w: r.width, h: r.height };
-        }
+        if (target) rect = rectInTop(target.getBoundingClientRect());
         try { window.webkit.messageHandlers.biliHover.postMessage({ over: v, rect: rect }); } catch (e) {}
       }
       function update(x, y, force) {
@@ -113,27 +154,62 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate, WKUID
         try { window.webkit.messageHandlers.biliDblClick.postMessage({}); } catch (err) {}
       }, true);
 
-      // 供原生调用:向播放器转发滚轮事件以调整"播放器音量",返回调节后的音量(0~1,-1=无视频)
-      function mainVideo() {
-        var vs = document.querySelectorAll('video');
-        var best = null, bestArea = -1;
-        for (var i = 0; i < vs.length; i++) {
-          var a = (vs[i].videoWidth || 0) * (vs[i].videoHeight || 0);
-          if (a > bestArea) { bestArea = a; best = vs[i]; }
-        }
-        return best;
-      }
-      // 暴露给原生:全屏切换前后读取/恢复暂停状态用
-      window.__biliViewerMainVideo = mainVideo;
+      // 供原生调用:调整本 frame 内主视频的"播放器音量",返回调节后的音量(0~1,-1=无视频)。
+      // dv 是原生算好的音量增量;这里不改派发合成 WheelEvent(会冒泡导致页面额外滚动)
       window.__biliViewerWheelVolume = function(dv) {
         var v = mainVideo();
         if (!v) return -1;
-        // dv 为原生计算好的音量增量;不向页面派发合成 WheelEvent(会冒泡导致页面滚动)
+        if (v.muted && dv > 0) v.muted = false;
         var nv = Math.min(1, Math.max(0, (v.volume || 0) + dv));
         v.volume = nv;
-        if (v.muted && nv > 0) v.muted = false;
         return nv;
       };
+      // 顶层聚合入口:直播播放器在 iframe 里,原生只会在主 frame 执行 JS,
+      // 这里沿同源 frame 树找到真正带视频的那个 frame。
+      if (window === window.top) {
+        window.__biliViewerWheelVolumeGlobal = function(dv) {
+          function walk(win) {
+            try {
+              if (win.__biliViewerWheelVolume) {
+                var r = win.__biliViewerWheelVolume(dv);
+                if (r >= 0) return r;
+              }
+            } catch (e) {}
+            try {
+              for (var i = 0; i < win.frames.length; i++) {
+                var r2 = walk(win.frames[i]);
+                if (r2 >= 0) return r2;
+              }
+            } catch (e) {}
+            return -1;
+          }
+          return walk(window);
+        };
+      }
+    })();
+    """
+
+    /// 直播播放器兜底:`navigator.mediaDevices` 在 WKWebView 里缺省为 undefined,
+    /// 而 B 站直播播放器初始化时会无条件调用 enumerateDevices(),导致 TypeError、画面不出来。
+    /// 正常情况下 Info.plist 里声明麦克风/摄像头用途后系统会提供真实 API,这里只在缺失时补一个空实现。
+    static let mediaDevicesFallbackJS = """
+    (function(){
+      if (navigator.mediaDevices) return;
+      var noop = function(){};
+      var stub = {
+        enumerateDevices: function(){ return Promise.resolve([]); },
+        getUserMedia: function(){ return Promise.reject(new Error('NotAllowedError')); },
+        getDisplayMedia: function(){ return Promise.reject(new Error('NotAllowedError')); },
+        addEventListener: noop,
+        removeEventListener: noop,
+        getSupportedConstraints: function(){ return {}; },
+        dispatchEvent: function(){ return false; }
+      };
+      try {
+        Object.defineProperty(Navigator.prototype, 'mediaDevices', { configurable: true, get: function(){ return stub; } });
+      } catch (e) {
+        try { Object.defineProperty(navigator, 'mediaDevices', { configurable: true, value: stub }); } catch (e2) {}
+      }
     })();
     """
 
@@ -148,6 +224,11 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate, WKUID
         let preferences = WKWebpagePreferences()
         preferences.allowsContentJavaScript = true
         config.defaultWebpagePreferences = preferences
+
+        // 直播播放器兜底:WKWebView 缺省不提供 navigator.mediaDevices,
+        // B 站直播播放器初始化会调用它,缺失时直接抛错导致画面出不来
+        let mediaScript = WKUserScript(source: Self.mediaDevicesFallbackJS, injectionTime: .atDocumentStart, forMainFrameOnly: false)
+        config.userContentController.addUserScript(mediaScript)
 
         // 注入播放器悬停检测脚本:光标在播放器上时滚轮交给原生调音量
         let hoverScript = WKUserScript(source: Self.hoverDetectJS, injectionTime: .atDocumentStart, forMainFrameOnly: false)
@@ -169,7 +250,7 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate, WKUID
             // 悬停播放器时滚轮 → 调整播放器(视频)音量
             volumeWebView.onPlayerVolumeAdjust = { [weak self] deltaY in
                 guard let self, let webView = self.webView else { return }
-                let js = "window.__biliViewerWheelVolume && window.__biliViewerWheelVolume(\(deltaY))"
+                let js = "window.__biliViewerWheelVolumeGlobal && window.__biliViewerWheelVolumeGlobal(\(deltaY))"
                 Task { @MainActor [weak self] in
                     guard let self else { return }
                     let result = try? await webView.evaluateJavaScript(js)
@@ -206,6 +287,20 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate, WKUID
         let appMenu = NSMenu()
         appMenuItem.submenu = appMenu
         appMenu.addItem(withTitle: "关于 BiliViewer", action: #selector(NSApplication.orderFrontStandardAboutPanel(_:)), keyEquivalent: "")
+        appMenu.addItem(.separator())
+        // 滚轮调音量的速度:菜单里即时切换,不用重新编译
+        let sensItem = NSMenuItem(title: "滚轮音量灵敏度", action: nil, keyEquivalent: "")
+        let sensMenu = NSMenu(title: "滚轮音量灵敏度")
+        sensItem.submenu = sensMenu
+        appMenu.addItem(sensItem)
+        for (title, pct) in [("慢", 60), ("标准", 100), ("快", 150)] {
+            let item = NSMenuItem(title: title, action: #selector(setVolumeSensitivity(_:)), keyEquivalent: "")
+            item.tag = pct
+            item.target = self
+            item.state = abs(VolumeWebView.playerVolumeSensitivity - Double(pct) / 100.0) < 0.001 ? .on : .off
+            sensMenu.addItem(item)
+            sensitivityItems.append(item)
+        }
         appMenu.addItem(.separator())
         appMenu.addItem(withTitle: "退出 BiliViewer", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
 
@@ -268,6 +363,10 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate, WKUID
     @objc private func goBack(_ sender: Any?) { webView.goBack() }
     @objc private func goForward(_ sender: Any?) { webView.goForward() }
     @objc private func goHome(_ sender: Any?) { webView.load(URLRequest(url: homeURL)) }
+    @objc private func setVolumeSensitivity(_ sender: NSMenuItem) {
+        VolumeWebView.setPlayerVolumeSensitivity(Double(sender.tag) / 100.0)
+        for item in sensitivityItems { item.state = (item === sender) ? .on : .off }
+    }
     @objc private func actualSize(_ sender: Any?) { webView.magnification = 1.0 }
 
     // MARK: - WKUIDelegate(弹窗/新窗口)
@@ -397,24 +496,67 @@ final class VolumeWebView: WKWebView {
     /// 播放器在页面视口中的矩形(CSS 坐标,顶部原点),由注入 JS 上报
     var playerRectInPage = NSRect.zero
 
+    // MARK: - 滚轮音量手感
+
+    /// 每 1 点滚动位移(scrollingDeltaY)对应的播放器音量变化。
+    /// 原来 0.004 太快:一次触控板滑动就能把音量拉满/拉到底,这里降到 0.0012(约 1/3.3 速度)。
+    private static let playerVolumeGainPrecise = 0.0012
+    /// 每 1 行滚动(deltaY)对应的播放器音量变化(普通滚轮鼠标),单次事件最多按 3 行计
+    private static let playerVolumeGainWheel = 0.006
+    /// 单次滚动事件的音量变化上限,避免鼠标加速/高速滚动时一步跳太多
+    private static let playerVolumeMaxStep = 0.01
+
+    /// 灵敏度倍率(默认 1.0)。菜单「滚轮音量灵敏度」可即时切换,
+    /// 也可以用 `defaults write local.biliviewer PlayerVolumeScrollSensitivity -float 0.6` 微调
+    static var playerVolumeSensitivity: Double = {
+        let v = UserDefaults.standard.double(forKey: PlayerVolumeScrollSensitivityKey)
+        return v > 0 ? v : 1.0
+    }()
+    static let PlayerVolumeScrollSensitivityKey = "PlayerVolumeScrollSensitivity"
+
+    /// 写入并立即生效
+    static func setPlayerVolumeSensitivity(_ value: Double) {
+        let v = value > 0 ? value : 1.0
+        playerVolumeSensitivity = v
+        UserDefaults.standard.set(v, forKey: PlayerVolumeScrollSensitivityKey)
+    }
+
+    /// 把一次滚轮事件换算成播放器音量增量(带符号,向上滚为正)
+    private static func playerVolumeDelta(for event: NSEvent, dy: CGFloat) -> Double {
+        let raw: Double
+        if event.hasPreciseScrollingDeltas {
+            raw = Double(dy) * playerVolumeGainPrecise
+        } else {
+            raw = max(-3, min(3, Double(dy))) * playerVolumeGainWheel
+        }
+        let step = raw * playerVolumeSensitivity
+        return max(-playerVolumeMaxStep, min(playerVolumeMaxStep, step))
+    }
+
     override func scrollWheel(with event: NSEvent) {
+        // 惯性滚动(手指抬起后的减速阶段)不再继续调音量:
+        // 否则一甩手指,惯性事件会把音量一路推到 0% 或 100%
+        if !event.momentumPhase.isEmpty {
+            if isCursorOverPlayer { return }
+            super.scrollWheel(with: event)
+            return
+        }
         // 关键:高精度设备(触控板/Magic Mouse)上 deltaY 常为 0,真实量在 scrollingDeltaY
         let dy: CGFloat = event.hasPreciseScrollingDeltas ? event.scrollingDeltaY : event.deltaY
-        if abs(dy) > 0.0001 {
-            if isCursorOverPlayer {
-                // dy(AppKit 向上滚为正)直接作为音量增量符号:向上滚 = 音量增。
-                // 注意:dv 是音量增量,不再需要旧方案里"转浏览器 deltaY 约定"的取反。
-                let dv = event.hasPreciseScrollingDeltas
-                    ? Double(dy) * 0.004
-                    : Double(dy > 0 ? 1 : -1) * 0.02
-                onPlayerVolumeAdjust?(dv)
-                return
-            }
-            if event.modifierFlags.contains(.option) {
-                let step: Float32 = event.hasPreciseScrollingDeltas ? 0.008 : 0.04
-                onVolumeAdjust?(SystemVolume.adjust(byDelta: Float32(dy) * step))
-                return
-            }
+        guard abs(dy) > 0.0001 else {
+            super.scrollWheel(with: event)
+            return
+        }
+        if isCursorOverPlayer {
+            // dy(AppKit 向上滚为正)直接作为音量增量符号:向上滚 = 音量增。
+            let dv = Self.playerVolumeDelta(for: event, dy: dy)
+            if abs(dv) > 0.000_000_1 { onPlayerVolumeAdjust?(dv) }
+            return
+        }
+        if event.modifierFlags.contains(.option) {
+            let step: Float32 = event.hasPreciseScrollingDeltas ? 0.008 : 0.04
+            onVolumeAdjust?(SystemVolume.adjust(byDelta: Float32(dy) * step))
+            return
         }
         super.scrollWheel(with: event)
     }

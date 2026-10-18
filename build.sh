@@ -38,7 +38,10 @@ cp "$BUILD_DIR/AppIcon.icns" "$CONTENTS/Resources/AppIcon.icns"
 printf 'APPL????' > "$CONTENTS/PkgInfo"
 
 echo "==> [4/5] Ad-hoc 签名"
-codesign --force --deep -s - "$APP_DIR"
+# 构建目录位于 iCloud/OneDrive 等同步盘时,文件会带上 FinderInfo / fileprovider 扩展属性,
+# 直接签名会报 "resource fork, Finder information, or similar detritus not allowed"
+xattr -cr "$APP_DIR" 2>/dev/null || true
+codesign --force -s - "$APP_DIR"
 
 echo "==> [5/5] 打包 DMG"
 rm -rf "$BUILD_DIR/dmg-staging" "$BUILD_DIR/$APP_NAME.dmg"

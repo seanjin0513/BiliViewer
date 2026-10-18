@@ -9,9 +9,9 @@
 	<key>CFBundleIdentifier</key>
 	<string>local.biliviewer</string>
 	<key>CFBundleVersion</key>
-	<string>1.0</string>
+	<string>1.1</string>
 	<key>CFBundleShortVersionString</key>
-	<string>1.0</string>
+	<string>1.1</string>
 	<key>CFBundlePackageType</key>
 	<string>APPL</string>
 	<key>CFBundleExecutable</key>
@@ -22,6 +22,13 @@
 	<string>14.0</string>
 	<key>NSHighResolutionCapable</key>
 	<true/>
+	<!-- WKWebView 只有在 App 声明了麦克风/摄像头用途后才会暴露 navigator.mediaDevices。
+	     B 站直播播放器初始化时会调用 navigator.mediaDevices.enumerateDevices(),
+	     该 API 缺失会抛 TypeError,导致直播画面出不来(普通视频页不受影响)。 -->
+	<key>NSMicrophoneUsageDescription</key>
+	<string>用于哔哩哔哩直播页面的语音/连麦等功能</string>
+	<key>NSCameraUsageDescription</key>
+	<string>用于哔哩哔哩直播页面的摄像头/连麦等功能</string>
 	<key>NSHumanReadableCopyright</key>
 	<string>Personal wrapper for bilibili.com</string>
 	<key>NSPrincipalClass</key>
