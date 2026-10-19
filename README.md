@@ -48,6 +48,7 @@ BiliViewer/
 - **UA 注入**:默认 UA 会被 B 站判定"浏览器版本过低",注入 Chrome UA 解决
 - **播放器悬停检测**:注入 JS,用 `elementFromPoint` + `closest()` 检测光标是否在播放器上,60ms 节流,经 `WKScriptMessageHandler` 回传原生
 - **悬停预览不算播放器**:B 站首页/推荐位的悬停预览同样是 `.bpx-player-container` + `<video>`,与主播放器同构,不能只按容器名判断。注入脚本用卡片祖先(如 `v-inline-player`、`v-recommend-inline-player`、`bili-video-card`、`video-page-card-small`)排除预览,并把预览视频排除出 `mainVideo()`,否则滚轮会被预览视频"抢走"变成调音量
+- **返回后重置悬停状态**:WKWebView 返回上一页时,旧页面的"光标在播放器上"状态会残留,导致返回后滚轮被继续当成调音量吞掉、页面滚不动。注入脚本在 `pageshow` / `pagehide` / `popstate` 和新文档启动时上报 `over:false`,原生在 `didStartProvisionalNavigation` / `didCommit` 再兜底清理,返回后立即恢复页面滚动
 - **播放器音量**:直接修改 `video.volume`(不走合成事件,B 站会忽略非 `isTrusted` 事件)
 - **全屏播放状态保护**:B 站全屏切换会重建播放器(暂停的变播放、播放的变暂停),切换后 2 秒内轮询纠正回原状态
 - **AppKit 与浏览器滚动方向**:NSEvent 的 `deltaY`(向上滚为正)与浏览器 WheelEvent 相反,转换时需注意;触控板等精确设备要用 `hasPreciseScrollingDeltas` 判断

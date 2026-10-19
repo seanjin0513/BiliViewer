@@ -134,6 +134,28 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate, WKUID
       document.addEventListener('mousemove', function(e){ update(e.clientX, e.clientY, false); }, true);
       document.addEventListener('scroll', function(){ if (lastX >= 0) update(lastX, lastY, true); }, true);
 
+      // 页面切换/后退返回时清掉悬停状态。否则原生端 isCursorOverPlayer 会停留在离开页面
+      // 之前的 true:返回后滚轮被继续当成"调音量"吞掉,页面无法上下滚动(要等鼠标动一下才恢复)。
+      // 只在顶层 frame 发重置消息,避免 late-loading iframe 的 pageshow 误清主播放器状态。
+      function resetHover(recompute) {
+        var x = lastX, y = lastY;
+        over = false;
+        lastX = -1; lastY = -1; lastT = 0; lastPost = 0;
+        if (window === window.top) {
+          try { window.webkit.messageHandlers.biliHover.postMessage({ over: false, rect: null }); } catch (e) {}
+        }
+        // BFCache 恢复时鼠标可能没动过,用离开前最后的坐标重新命中一次
+        if (recompute && x >= 0) update(x, y, true);
+      }
+      // 只在顶层 frame 监听页面生命周期,避免 iframe 的 pageshow 误清/误报主播放器状态
+      if (window === window.top) {
+        window.addEventListener('pageshow', function(){ resetHover(true); });
+        window.addEventListener('pagehide', function(){ resetHover(false); });
+        window.addEventListener('popstate', function(){ resetHover(true); });
+      }
+      // 新文档一开始就同步一次"未悬停",清掉上一个页面残留的状态
+      resetHover(false);
+
       // 接管视频区域的单击/双击(WebKit 不支持 HTML5 element fullscreen,由原生组合实现):
       // - 单击 = 切换播放/暂停(延迟 260ms,给双击留取消窗口)
       // - 双击 = 网页版式真全屏(原生:网页全屏 + 窗口全屏),不改变播放状态
@@ -401,6 +423,20 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate, WKUID
         decisionHandler(.allow)
     }
 
+    // 导航开始/提交时清掉上一页残留的"悬停播放器"状态。
+    // 未清的话,从视频页返回后滚轮会继续被当成调音量吞掉,页面滚不动。
+    func webView(_ webView: WKWebView, didStartProvisionalNavigation navigation: WKNavigation!) {
+        (webView as? VolumeWebView)?.resetPlayerHover()
+    }
+
+    func webView(_ webView: WKWebView, didCommit navigation: WKNavigation!) {
+        (webView as? VolumeWebView)?.resetPlayerHover()
+    }
+
+    func webViewWebContentProcessDidTerminate(_ webView: WKWebView) {
+        (webView as? VolumeWebView)?.resetPlayerHover()
+    }
+
     // MARK: - NSWindowDelegate
 
     private static let windowFrameKey = "BiliViewerSavedWindowFrame"
@@ -511,6 +547,13 @@ final class VolumeWebView: WKWebView {
     var isCursorOverPlayer = false
     /// 播放器在页面视口中的矩形(CSS 坐标,顶部原点),由注入 JS 上报
     var playerRectInPage = NSRect.zero
+
+    /// 页面导航/返回时清除悬停状态:否则旧页面残留的 isCursorOverPlayer=true
+    /// 会让返回后所有滚轮事件继续被当成"调音量"吞掉,页面无法滚动。
+    func resetPlayerHover() {
+        isCursorOverPlayer = false
+        playerRectInPage = .zero
+    }
 
     // MARK: - 滚轮音量手感
 
@@ -623,10 +666,16 @@ extension BrowserWindowController: WKScriptMessageHandler {
               let over = payload["over"] as? Bool else { return }
         guard let wv = webView as? VolumeWebView else { return }
         wv.isCursorOverPlayer = over
+        if !over {
+            wv.playerRectInPage = .zero
+            return
+        }
         if let r = payload["rect"] as? [String: Any],
            let x = r["x"] as? Double, let y = r["y"] as? Double,
            let w = r["w"] as? Double, let h = r["h"] as? Double {
             wv.playerRectInPage = NSRect(x: x, y: y, width: w, height: h)
+        } else {
+            wv.playerRectInPage = .zero
         }
     }
 
