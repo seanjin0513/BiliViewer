@@ -44,15 +44,27 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate, WKUID
 
     /// 播放器悬停检测:mousemove/scroll 时用 elementFromPoint 命中测试,
     /// 状态变化(或悬停中每 300ms)经 biliHover 回传 {over, rect} 给原生(60ms 节流)。
+    /// 卡片/推荐位的悬停预览与主播放器同构,需按卡片祖先排除,否则滚轮会被预览视频抢走。
     /// 每个同源 frame 都会注入(新版直播播放器位于 /blanc/<room> 的同源 iframe),
     /// rect 会逐级换算成顶层页面坐标,供音量 HUD 正确定位。
     static let hoverDetectJS = """
     (function(){
+      // ---- 卡片/推荐位里的"悬停预览"识别 ----
+      // B 站首页/推荐位的悬停预览同样用 .bpx-player-container + <video> 实现(与主播放器同构),
+      // 只是被包在卡片里:首页是 v-inline-player,视频页右侧推荐位是 v-recommend-inline-player。
+      // 这些预览视频上滚动滚轮必须继续滚动页面,不能触发调音量。
+      var PREVIEW_SELECTOR = '[class*="inline-player"], .bili-video-card, .bili-video-card__wrap, .bili-feed-card, .feed-card, .video-page-card-small, .bili-dyn-card, .bili-dyn-card-video, .bili-live-card, .bili-cover-card, .recommend-list-v1, .rec-list';
+      function inPreview(el) {
+        return !!(el && el.closest && el.closest(PREVIEW_SELECTOR));
+      }
+
       // ---- 播放器/视频定位(每个 frame 各自执行) ----
       function mainVideo() {
         var vs = document.querySelectorAll('video');
         var best = null, bestArea = -1;
         for (var i = 0; i < vs.length; i++) {
+          // 卡片悬停预览里的 video 不算"主视频"
+          if (inPreview(vs[i])) continue;
           var a = (vs[i].videoWidth || 0) * (vs[i].videoHeight || 0);
           if (a > bestArea) { bestArea = a; best = vs[i]; }
         }
@@ -67,9 +79,11 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate, WKUID
       function findPlayer(x, y) {
         var el = document.elementFromPoint(x, y);
         if (!el) return null;
-        if (el.tagName === 'VIDEO') return el;
+        // 悬停预览/卡片小视频不是"播放器":滚轮交给页面正常滚动
+        if (inPreview(el)) return null;
         var c = el.closest && el.closest(PLAYER_SELECTOR);
-        if (c) return c;
+        // 只认主播放器容器里的 <video>;页面里其他零散视频不抢滚轮
+        if (c) return el.tagName === 'VIDEO' ? el : c;
         // 兜底:指针落在主视频矩形内(新版直播播放器有弹幕/控制层遮挡,命中的 DOM 不一定是容器)
         var v = mainVideo();
         if (v) {
@@ -127,6 +141,8 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate, WKUID
       function inVideoArea(e) {
         var el = document.elementFromPoint(e.clientX, e.clientY);
         if (!el) return false;
+        // 卡片/推荐位的悬停预览不是主播放器:不接管单击/双击,保持 B 站原生跳转
+        if (inPreview(el)) return false;
         var p = (el.tagName === 'VIDEO') ? el : (el.closest && el.closest('.bpx-player-container, .bilibili-player'));
         if (!p) return false;
         if (el.closest && el.closest('button, a, input, [role=button], .bpx-player-ctrl-btn, .bpx-player-control-bottom, .bpx-player-sending-bar, .bpx-player-video-progress, .bpx-player-video-btnstart, .bilibili-player-video-control')) return false;
